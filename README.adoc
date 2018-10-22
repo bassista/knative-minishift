@@ -13,11 +13,13 @@ Run the following command to verify your minishift is configured correctly:
 [source,bash]
 ----
 # returns minishift v1.25.0+90fb23e
-minishift version 
+minishift version
 ----
 
 [source,bash]
 -----
+#!/bin/bash
+
 # make sure the profile is set correctly
 minishift profile set knative
 
@@ -53,6 +55,7 @@ eval $(minishift docker-env) && eval $(minishift oc-env)
 [source,bash]
 ----
 #!/bin/bash
+
 # Enable admission controller webhooks
 # The configuration stanzas below look weird and are just to workaround
 # https://bugzilla.redhat.com/show_bug.cgi?id=1635918
@@ -85,58 +88,117 @@ minishift openshift config set --target=kube --patch '{
 https://docs.okd.io/3.10/admin_guide/manage_scc.html[SCCs (Security Context Constraints)] are the precursor to the PSP (Pod Security Policy) mechanism in Kubernetes.
 
 ----
-oc project myproject 
-# Set privileged scc to default SA in myproject
-oc adm policy add-scc-to-user privileged -z default
-# Automatic Istio sidecar injection
-oc label namespace myproject istio-injection=enabled
-oc get namespace --show-labels  #<1>
+oc project myproject
+# Set privileged and anyuid scc to default SA in myproject
+oc adm policy add-scc-to-user privileged -z default -n myproject
+oc adm policy add-scc-to-user anyuid -z default -n myproject
 ----
-
-<1> This should show the **myproject** namespace with **istio-injection=enabled** label
 
 == Knative Deployment
 
 === Istio
 
+This tutorial uses the https://docs.openshift.com/container-platform/3.11/servicemesh-install/servicemesh-install.html[Red Hat OpenShift Service Mesh] to get Istio up and running, which includes Jaeger and Kiali.
+
+
+You need to set the system limits on `mmap` counts otherwise Elasticsearch will fail.
+Jaeger uses Elasticsearch and it is part of the Red Hat OpenShift Service Mesh.
+Elasticsearch uses a `mmapfs` directory by default to store its indices.
+The default operating system limits on `mmap` counts is likely to be too low, which may result in out of memory exceptions.
+To fix this you have to login into the minishift instance and do the following
+
 [source,bash]
 ----
-
-# Grant the necessary privileges to the service accounts Istio will use:
-oc adm policy add-scc-to-user anyuid -z istio-ingress-service-account -n istio-system
-oc adm policy add-scc-to-user anyuid -z default -n istio-system
-oc adm policy add-scc-to-user anyuid -z prometheus -n istio-system
-oc adm policy add-scc-to-user anyuid -z istio-egressgateway-service-account -n istio-system
-oc adm policy add-scc-to-user anyuid -z istio-citadel-service-account -n istio-system
-oc adm policy add-scc-to-user anyuid -z istio-ingressgateway-service-account -n istio-system
-oc adm policy add-scc-to-user anyuid -z istio-cleanup-old-ca-service-account -n istio-system
-oc adm policy add-scc-to-user anyuid -z istio-mixer-post-install-account -n istio-system
-oc adm policy add-scc-to-user anyuid -z istio-mixer-service-account -n istio-system
-oc adm policy add-scc-to-user anyuid -z istio-pilot-service-account -n istio-system
-oc adm policy add-scc-to-user anyuid -z istio-sidecar-injector-service-account -n istio-system
-oc adm policy add-cluster-role-to-user cluster-admin -z istio-galley-service-account -n istio-system
-
-# Deploy Istio
-curl -L https://storage.googleapis.com/knative-releases/serving/latest/istio.yaml
+$ minishift ssh
+[docker@istio-tutorial ~]$ sudo -i
+[root@istio-tutorial ~]$ echo "vm.max_map_count = 262144" > /etc/sysctl.d/99-elasticsearch.conf
+[root@istio-tutorial ~]$ sysctl vm.max_map_count=262144
+[root@istio-tutorial ~]$ exit
+logout
+[docker@istio-tutorial ~]$ exit
+logout
 ----
 
-[IMPORTANT]
-=====
-The Istio v1.0.1 and above release automatic sidecar injection has removed `privileged:true` from init containers,this will cause the Pods with istio proxies automatic inject to crash. Run the following command to update the **istio-sidecar-injector** ConfigMap
+Now your system is prepared and we can install Istio operator
 
-[sources,bash]
+[source,bash]
 ----
-#/bin/bash
+#!/bin/bash
 
-$ oc get cm istio-sidecar-injector -n istio-system -oyaml | sed -e 's/securityContext:/securityContext:\\n      privileged: true/' | oc replace -f -
+oc new-project istio-operator
+oc new-app -f https://raw.githubusercontent.com/Maistra/openshift-ansible/maistra-0.3/istio/istio_community_operator_template.yaml --param=OPENSHIFT_ISTIO_MASTER_PUBLIC_URL="https://$(minishift ip):8443"
 ----
 
-Please run this command only once to avoid multiple additions
-=====
+Wait for the operator to be ready
 
-<1> This will setup the required OpenShift security policies that are required to deploy and make Istio functional
+[source,bash]
+----
+$ oc get pods -w -n istio-operator
 
-Wait until all the pods on istio-system are up and running, you can verify it with the command `oc get pods -w -n istio-system`.
+NAME                              READY     STATUS    RESTARTS   AGE
+istio-operator-58c45d8f64-jdsrz   1/1       Running   0          10s
+----
+
+Once operator is ready, create an installation for Istio
+
+[source,bash]
+----
+#!/bin/bash
+oc project istio-operator
+cat <<EOF >>/tmp/istio-cr.yaml
+apiVersion: "istio.openshift.com/v1alpha1"
+kind: "Installation"
+metadata:
+  name: "istio-installation"
+spec:
+  deployment_type: origin
+  istio:
+    authentication: false
+    community: true
+    prefix: maistra/
+    version: 0.3.0
+  jaeger:
+    prefix: jaegertracing/
+    version: 1.7.0
+    elasticsearch_memory: 2Gi
+  kiali:
+    username: kialiadmin
+    password: kialiadmin
+    prefix: kiali/
+    version: v0.8.1
+EOF
+oc create -f /tmp/istio-cr.yaml
+----
+
+NOTE: if you want mutual TLS enabled by default, change the parameter `authentication` to `true`.
+
+Wait for Istio's components to be ready
+
+[source,bash]
+----
+$ oc get pods -n istio-system
+
+NAME                                          READY     STATUS      RESTARTS   AGE
+elasticsearch-0                               1/1       Running     0          3m
+grafana-648c7d5cc6-d4cgr                      1/1       Running     0          3m
+istio-citadel-64f86c964-vjd6f                 1/1       Running     0          5m
+istio-egressgateway-8579f6f649-zwmqh          1/1       Running     0          5m
+istio-galley-569c79fcbf-rc24l                 1/1       Running     0          5m
+istio-ingressgateway-5457546784-gct2p         1/1       Running     0          5m
+istio-pilot-78d8f7465f-kmclw                  2/2       Running     0          5m
+istio-policy-b57648f9f-cvj82                  2/2       Running     0          5m
+istio-sidecar-injector-5876f696f-s2pdt        1/1       Running     0          5m
+istio-statsd-prom-bridge-549d687fd9-g2gmc     1/1       Running     0          5m
+istio-telemetry-56587b8fb6-wpg9k              2/2       Running     0          5m
+jaeger-agent-6qgrl                            1/1       Running     0          3m
+jaeger-collector-9cbd5f46c-kt9w9              1/1       Running     0          3m
+jaeger-query-6678967b5-8sgdp                  1/1       Running     0          3m
+kiali-6b8c686d9b-mkxdv                        1/1       Running     0          2m
+openshift-ansible-istio-installer-job-rj7pj   0/1       Completed   0          7m
+prometheus-6ffc56584f-zgbv9                   1/1       Running     0          5m
+----
+
+IMPORTANT: The Istio sidecar injection mechanism that comes with Red Hat Service Mesh allows you to automatically inject the sidecar to your services by adding `sidecar.istio.io/inject: "true"` annotation to your service. See https://github.com/Maistra/bookinfo/blob/master/bookinfo.yaml[Bookinfo] as an example how to achieve this.
 
 === Knative Serving
 
@@ -153,8 +215,12 @@ oc adm policy add-scc-to-user anyuid -z autoscaler -n knative-serving
 oc adm policy add-cluster-role-to-user cluster-admin -z build-controller -n knative-build
 oc adm policy add-cluster-role-to-user cluster-admin -z controller -n knative-serving
 
-# Deploy Knative serving 
-curl -L https://storage.googleapis.com/knative-releases/serving/latest/release-no-mon.yaml
+# Deploy Knative serving
+curl -L https://storage.googleapis.com/knative-releases/serving/latest/release-no-mon.yaml \
+  | sed 's/docker.io\/istio\/.*$/maistra\/proxyv2-centos7:0.3.0/' \
+  | sed 's/istio-pilot:8080/istio-pilot.istio-system:15005/' \
+  | oc apply -f -
+
 ----
 
 <1> This will setup the required OpenShift security policies that are required to deploy and make Knative functional
@@ -176,7 +242,7 @@ sudo ip route add $(minishift openshift config view | grep ingressIPNetworkCIDR 
 ----
 ====
 
-== App Deployment 
+== App Deployment
 
 [sources,bash]
 -----
@@ -201,10 +267,10 @@ spec:
             - name: TARGET # The environment variable printed out by the sample app
               value: "Go Sample v1"
 ' | oc create -f -
- 
+
 # Wait for the hello pod to enter its `Running` state
 oc get pod --watch
- 
+
 # This should output 'Hello World: Go Sample v1!'
 curl -H "Host: helloworld-go.myproject.example.com" http://$IP_ADDRESS
 
